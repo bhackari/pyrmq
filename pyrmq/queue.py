@@ -1,6 +1,4 @@
 from typing import List
-import time
-import threading
 import redis.asyncio as redis
 import asyncio
 import uuid
