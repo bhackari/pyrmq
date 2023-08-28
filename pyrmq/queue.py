@@ -1,19 +1,18 @@
 import redis.asyncio as redis
 import asyncio
-import uuid
 import random
 import string
 
-from .delivery import Delivery
 from .cleaner import Cleaner
 from .deliveries import Deliveries
+from .delivery import Delivery
 
 
 # TODO(mirco): implement error handling in case of timeouts
 class Queue(object):
 
-    def __init__(self, connection: redis.Redis, queue_name: str, tag: str):
-        self.connection = connection
+    def __init__(self, client: redis.Redis, queue_name: str, tag: str):
+        self.client = client
         self.queue_name = queue_name
         self.tag = tag
 
@@ -28,30 +27,30 @@ class Queue(object):
         self.heartbeat_duration = 60
 
         self.tasks = []
-        self.cleaner = Cleaner(connection, self.connections_key, self.ready_key, self.rejected_key, self.unacked_key)
+        self.cleaner = Cleaner(client, self.connections_key, self.ready_key, self.rejected_key, self.unacked_key)
         self.tasks.append(asyncio.create_task(self.cleaner.clean()))
 
     async def wait(self):
         return await asyncio.wait(self.tasks)
 
     async def publish(self, payload: str):
-        await self.connection.lpush(self.ready_key, payload)
+        return await self.client.lpush(self.ready_key, payload)
 
     def attach_consumer(self, consumer):
         async def wrapper():
-            await self.connection.sadd(self.connections_key, f'{self.tag}-{self.connection_uuid}')
+            await self.client.sadd(self.connections_key, f'{self.tag}-{self.connection_uuid}')
 
             while True:
-                payload = await self.connection.rpoplpush(self.ready_key, self.unacked_key)
+                payload = await self.client.rpoplpush(self.ready_key, self.unacked_key)
                 if payload is None:
                     continue
 
-                delivery = Delivery(self.connection, self.unacked_key, self.rejected_key, payload)
+                delivery = Delivery(self.client, self.unacked_key, self.rejected_key, payload)
                 await consumer(delivery)
 
         async def update_heartbeat():
             while True:
-                await self.connection.set(self.heartbeat_key, "1", self.heartbeat_duration)
+                await self.client.set(self.heartbeat_key, "1", self.heartbeat_duration)
                 await asyncio.sleep(10)
 
         self.tasks.append(asyncio.create_task(wrapper()))
@@ -59,35 +58,32 @@ class Queue(object):
 
     def attach_batch_consumer(self, size: int, timeout: int, consumer):
         async def wrapper():
-            await self.connection.sadd(self.connections_key, f'{self.tag}-{self.connection_uuid}')
-            deliveries = []
+            await self.client.sadd(self.connections_key, f'{self.tag}-{self.connection_uuid}')
 
             async def consume(deliveries):
-                while True:
-                    payload = await self.connection.rpoplpush(self.ready_key, self.unacked_key)
+                while len(deliveries) < size:
+                    # TODO(mirco): we should pipeline this when batch sizes are big
+                    payload = await self.client.brpoplpush(self.ready_key, self.unacked_key)
                     if payload is None:
                         continue
 
-                    delivery = Delivery(self.connection, self.unacked_key, self.rejected_key, payload)
+                    delivery = Delivery(self.client, self.unacked_key, self.rejected_key, payload)
                     deliveries.append(delivery)
-
-                    if len(deliveries) >= size:
-                        return
+                return
 
             while True:
+                deliveries = []
                 try:
-                    await asyncio.wait_for(consume(deliveries), timeout=timeout)
+                    await asyncio.wait_for(consume(deliveries), timeout)
                 except asyncio.exceptions.TimeoutError:
-                    await consumer(Deliveries(deliveries))
-                    deliveries = []
-
-                if len(deliveries) >= size:
-                    await consumer(Deliveries(deliveries))
-                    deliveries = []
+                    pass
+                finally:
+                    if len(deliveries):
+                        await consumer(Deliveries(self.client, deliveries))
 
         async def update_heartbeat():
             while True:
-                await self.connection.set(self.heartbeat_key, "1", self.heartbeat_duration)
+                await self.client.set(self.heartbeat_key, "1", self.heartbeat_duration)
                 await asyncio.sleep(10)
 
         self.tasks.append(asyncio.create_task(wrapper()))

@@ -1,16 +1,25 @@
 from typing import List
-import asyncio
+import redis.asyncio as redis
 
 from .delivery import Delivery
 
 
 class Deliveries(object):
 
-    def __init__(self, deliveries: List[Delivery]):
+    def __init__(self, client: redis.Redis, deliveries: List[Delivery]):
+        self.client = client
         self.deliveries = deliveries
 
     async def ack(self):
-        return await asyncio.gather(*[delivery.ack() for delivery in self.deliveries])
+        pipe = self.client.pipeline()
+        pipe.multi()
+        for delivery in self.deliveries:
+            await pipe.lrem(delivery.unacked_key, 1, delivery.payload)
+        return await pipe.execute()
 
     async def reject(self):
-        return await asyncio.gather(*[delivery.reject() for delivery in self.deliveries])
+        pipe = self.client.pipeline()
+        pipe.multi()
+        for delivery in self.deliveries:
+            await pipe.lrem(delivery.unacked_key, 1, delivery.payload)
+        return await pipe.execute()
